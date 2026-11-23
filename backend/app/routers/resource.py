@@ -96,3 +96,50 @@ def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResu
     service = require_service(module)
     entry, message = service.run_action(entry_id, payload.action.strip())
     return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.get("/{module}/{entry_id}/lineage", response_model=dict)
+def query_lineage(module: str, entry_id: int, request: Request) -> dict[str, Any]:
+    """回查某个业务对象登记的血缘。
+
+    * 目录同步：按批次回查整组，返回 complete 标记；组不齐全时 lineages 为空；
+    * 快照生成器：按快照编号定位它自己登记的那一条来源关系。
+
+    可选查询参数 ``batch_id``、``source`` 用于显式指定批次编号或来源命名空间。
+    """
+    service = require_service(module)
+    options = {
+        key: value for key, value in request.query_params.items()
+        if key in ("batch_id", "source") and value.strip()
+    }
+    if hasattr(service, "query_registered_lineage"):
+        return service.query_registered_lineage(entry_id, **options)
+    if hasattr(service, "query_snapshot_lineage"):
+        return service.query_snapshot_lineage(entry_id)
+    raise HTTPException(status_code=404, detail=f"{module} 未登记血缘")
+
+
+@router.post("/{module}/{entry_id}/lineage", response_model=dict)
+def register_lineage(
+    module: str,
+    entry_id: int,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """登记/续写某个业务对象的血缘批次。
+
+    请求体可选：``records`` 指定关系，``expected_count`` 指定整组条数，
+    ``limit`` 只写入前几条（模拟中断），``start_index`` 指定从第几条续写，
+    ``dry_run`` 只预检冲突不写入。
+    """
+    service = require_service(module)
+    body = payload or {}
+    if hasattr(service, "register_lineage_batch"):
+        known = {"expected_count", "limit", "start_index", "dry_run", "batch_id"}
+        extra = {key: value for key, value in body.items() if key in known}
+        records = body.get("records")
+        if records is not None and not isinstance(records, (list, dict)):
+            raise HTTPException(status_code=422, detail="records 必须是关系列表")
+        return service.register_lineage_batch(entry_id, records, **extra)
+    if hasattr(service, "query_snapshot_lineage"):
+        return service.create_snapshot_with_lineage(entry_id)
+    raise HTTPException(status_code=404, detail=f"{module} 未登记血缘")

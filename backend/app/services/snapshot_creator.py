@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.services import lineage_registry
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -43,20 +44,28 @@ class SnapshotCreatorService(BaseModuleService):
         entry["文件大小"] = f"{self._estimate_snapshot_size(snapshot_type)} GB"
         entry["pending"] = False
 
-        lineage_rows = store.rows("lineage_graph")
-        lid = max((int(r.get("id", 0)) for r in lineage_rows), default=0) + 1
-        lineage_rows.append({
-            "id": lid,
-            "status": "已建立",
+        lineage_record = {
             "目标表": f"{dataset}_snapshot",
             "来源表列表": dataset,
             "转换逻辑": f"snapshot_{snapshot_type}_at_{snapshot_time}",
             "中间层级": "1",
             "血缘深度": "1",
-            "pending": False,
-            "abnormal": False,
             "snapshot_id": entry_id,
-        })
+        }
+        result = lineage_registry.register_lineage(
+            [lineage_record],
+            batch_id=entry_id,
+            source=lineage_registry.SOURCE_SNAPSHOT,
+            owner_id=entry_id,
+        )
+        if result.get("conflict"):
+            # 快照任务重复创建但元数据已变：保留首次登记的那一条来源，不覆盖。
+            existing = lineage_registry.snapshot_lineage(entry_id)
+            lid = existing.get("lineage_id")
+        else:
+            lid = (result.get("lineage_ids")
+                   or result.get("registered_lineage_ids")
+                   or [None])[0]
 
         return {
             "ok": True,
@@ -69,6 +78,17 @@ class SnapshotCreatorService(BaseModuleService):
             "lineage_id": lid,
             "message": "快照创建完成并已注册血缘",
         }
+
+    def query_snapshot_lineage(self, entry_id: int) -> dict[str, Any]:
+        """按快照编号定位自己登记的那一条来源关系。"""
+        result = lineage_registry.snapshot_lineage(entry_id)
+        if not result.get("found"):
+            return {"ok": False, "snapshot_id": entry_id, **result}
+        return {"ok": True, "snapshot_id": entry_id, **result}
+
+    def query_lineage_by_task_id(self, task_id: int) -> dict[str, Any]:
+        """同 ``query_snapshot_lineage``：按快照任务编号唯一定位来源。"""
+        return self.query_snapshot_lineage(task_id)
 
     def diff_snapshots(self, snapshot_id_a: int, snapshot_id_b: int) -> dict[str, Any]:
         """比较两个快照之间的数据差异。

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services import lineage_registry
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -163,6 +164,22 @@ class LineageGraphService(BaseModuleService):
             "downstream_chain": downstream["downstream_tree"],
             "orphan_risk": upstream["total_nodes"] == 0 and downstream["total_affected"] > 0,
         }
+
+    def lookup_registered_batch(
+        self,
+        batch_id: object,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        """回查共用血缘登记器写入的批次记录。
+
+        目录同步与快照生成都走同一个登记器，这里让血缘模块也能直接看到
+        批次组是否齐全；齐全才返回 lineages。
+        """
+        return lineage_registry.batch_status(batch_id, source=source)
+
+    def lookup_snapshot_lineage(self, snapshot_id: object) -> dict[str, Any]:
+        """按快照任务编号回查快照自己登记的那一条来源关系。"""
+        return lineage_registry.snapshot_lineage(snapshot_id)
 
     def impact_analysis(self, entry_id: int) -> dict[str, Any]:
         """变更影响分析：当某个血缘条目的转换逻辑发生变更时，

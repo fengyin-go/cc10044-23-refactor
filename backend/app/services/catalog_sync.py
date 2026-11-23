@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
+from app.services import lineage_registry
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -126,40 +127,126 @@ class CatalogSyncService(BaseModuleService):
             "manual_intervention_required": 1,
         }
 
-    def sync_with_lineage(self, entry_id: int) -> dict[str, Any]:
+    def sync_with_lineage(self, entry_id: int, **options: Any) -> dict[str, Any]:
         """同步完成后更新血缘关系。
 
         将同步范围内的表在目标Catalog的位置注册到血缘图谱，
         建立源→目标的跨Catalog血缘链路。
+
+        登记走共用血缘登记器，与快照生成器共用写入过程；返回字段保持原样。
+        额外关键字（如 ``limit=1``）可让本次只写入部分关系，模拟中断后用同一
+        任务编号再次调用即可把同批办完。
         """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"ok": False, "message": "同步任务不存在"}
 
-        lineage_rows = store.rows("lineage_graph")
-        start_id = max((int(r.get("id", 0)) for r in lineage_rows), default=0) + 1
-        new_lineages = []
-        for i in range(3):
-            lid = start_id + i
-            lineage_rows.append({
-                "id": lid,
-                "status": "已建立",
-                "目标表": f"{entry.get('目标Catalog')}_{entry.get('同步范围', 'table')}_{i}",
-                "来源表列表": f"{entry.get('源Catalog')}_{entry.get('同步范围', 'table')}_{i}",
-                "转换逻辑": f"catalog_sync_{entry_id}",
-                "中间层级": "1",
-                "血缘深度": "1",
-                "pending": False,
-                "abnormal": False,
-            })
-            new_lineages.append(lid)
+        options.pop("source", None)
+        options.pop("owner_id", None)
+        result = lineage_registry.register_lineage(
+            self._catalog_lineage_records(entry_id),
+            batch_id=entry_id,
+            source=lineage_registry.SOURCE_CATALOG,
+            owner_id=entry_id,
+            **options,
+        )
+        registered_ids = list(result.get("registered_lineage_ids", []))
 
         return {
             "ok": True,
             "task_id": entry_id,
-            "new_lineage_ids": new_lineages,
-            "message": f"已注册 {len(new_lineages)} 条血缘关系",
+            "new_lineage_ids": registered_ids,
+            "message": f"已注册 {len(registered_ids)} 条血缘关系",
         }
+
+    def _catalog_lineage_records(self, entry_id: int) -> list[dict[str, Any]]:
+        """构造目录同步要登记的三条来源关系（字段格式与 lineage_graph 一致）。"""
+        entry = store.find(self.MODULE, entry_id) or {}
+        target_catalog = entry.get("目标Catalog")
+        source_catalog = entry.get("源Catalog")
+        scope = entry.get("同步范围", "table")
+        return [
+            {
+                "目标表": f"{target_catalog}_{scope}_{i}",
+                "来源表列表": f"{source_catalog}_{scope}_{i}",
+                "转换逻辑": f"catalog_sync_{entry_id}",
+                "中间层级": "1",
+                "血缘深度": "1",
+            }
+            for i in range(3)
+        ]
+
+    def resume_lineage_registration(self, entry_id: int, **options: Any) -> dict[str, Any]:
+        """把上次中断的目录同步血缘批次继续办完，并回报整组状态。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": "同步任务不存在"}
+
+        batch_id = options.get("batch_id", entry_id)
+        lineage_registry.register_lineage(
+            self._catalog_lineage_records(entry_id),
+            batch_id=batch_id,
+            source=lineage_registry.SOURCE_CATALOG,
+            owner_id=entry_id,
+        )
+        status = lineage_registry.batch_status(
+            batch_id, source=lineage_registry.SOURCE_CATALOG)
+        return {
+            "ok": status["complete"],
+            "task_id": entry_id,
+            "batch_id": status["batch_id"],
+            "complete": status["complete"],
+            "registered_count": status["registered_count"],
+            "expected_count": status["expected_count"],
+            "lineage_ids": status["lineage_ids"],
+            "registered_lineages": status["lineages"],
+        }
+
+    def query_registered_lineage(self, entry_id: int, **options: Any) -> dict[str, Any]:
+        """回查本任务登记的血缘批次；组不齐全时不把已有记录当作整组生效。
+
+        可传 ``batch_id`` 指定其他批次，或 ``source`` 指定来源命名空间。
+        """
+        batch_id = options.get("batch_id", entry_id)
+        source = options.get("source") or lineage_registry.SOURCE_CATALOG
+        status = lineage_registry.batch_status(batch_id, source=source)
+        return {
+            "ok": status["complete"],
+            "task_id": entry_id,
+            **status,
+        }
+
+    def register_lineage_batch(
+        self,
+        entry_id: int,
+        records: Sequence[dict[str, Any]] | None = None,
+        *,
+        batch_id: object | None = None,
+        expected_count: int | None = None,
+        limit: int | None = None,
+        start_index: int = 0,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """用指定批次编号登记/补写目录同步血缘。
+
+        ``records`` 省略时使用该任务默认的三条来源关系；``limit=1`` 表示只写入
+        第一条后中断，后续用同一 ``entry_id`` 再次调用即可把同批办完；
+        ``start_index`` 可只提交批次中剩余的关系；``dry_run`` 只预检冲突不写入。
+        """
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": "同步任务不存在"}
+        relations = list(records) if records is not None else self._catalog_lineage_records(entry_id)
+        return lineage_registry.register_lineage(
+            relations,
+            batch_id=batch_id if batch_id is not None else entry_id,
+            source=lineage_registry.SOURCE_CATALOG,
+            owner_id=entry_id,
+            expected_count=expected_count,
+            limit=limit,
+            start_index=start_index,
+            dry_run=dry_run,
+        )
 
     def _resolve_sync_tables(self, catalog: str, scope: str) -> list[str]:
         base_tables = [
